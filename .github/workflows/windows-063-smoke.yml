@@ -1,0 +1,71 @@
+name: Windows 0.1.59 to 0.1.63 installed smoke
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-063-installed-smoke
+  cancel-in-progress: false
+jobs:
+  installed-smoke:
+    if: github.repository == 'sbbik/saminbun-desktop-releases' && github.event.repository.private == false
+    runs-on: windows-2025
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: qa
+          sparse-checkout-cone-mode: true
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22.22.0'
+      - name: Parse PowerShell and JS before installation
+        run: |
+          $errors = $null; $tokens = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path qa/windows-update-smoke.ps1), [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw 'POWERSHELL_PARSE_FAILED' }
+          node --check qa/windows-server-fixture.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'FIXTURE_PARSE_FAILED' }
+          node --check qa/windows-update-smoke.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'JAVASCRIPT_PARSE_FAILED' }
+      - name: Install only pinned QA dependency, no install scripts
+        working-directory: qa
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+          if ($LASTEXITCODE -ne 0) { throw 'QA_DEPENDENCY_INSTALL_FAILED' }
+      - name: Read public releases and pin real installers
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'https://github.com/sbbik/saminbun-desktop-releases/releases'
+          $pins = @{
+            '0.1.59' = '6f0d200c58d82d0cad32884bd404284fbd6f91a80b7a950885293e5ffa0e1875'
+            '0.1.63' = '4fb389ec56724bd3b89e3c432019cf052a6c48f49961eb651715f1846c6cb77c'
+          }
+          foreach ($version in $pins.Keys) {
+            $name = "saminbun-setup-$version-x64.exe"
+            Invoke-WebRequest "$base/download/v$version/$name" -OutFile $name
+            if ((Get-FileHash $name -Algorithm SHA256).Hash -ine $pins[$version]) { throw 'PUBLIC_INSTALLER_HASH_MISMATCH' }
+          }
+          Invoke-WebRequest "$base/latest/download/latest.yml" -OutFile latest.yml
+          $feed = Get-Content latest.yml -Raw
+          if ($feed -notmatch '(?m)^version: 0\.1\.63\s*$') { throw 'LATEST_FEED_IS_NOT_063' }
+          $sha512 = [Convert]::ToBase64String([Security.Cryptography.SHA512]::HashData([IO.File]::ReadAllBytes((Resolve-Path saminbun-setup-0.1.63-x64.exe))))
+          if ($feed -notmatch [regex]::Escape($sha512) -or $feed -notmatch 'saminbun-setup-0\.1\.63-x64\.exe') { throw 'LATEST_FEED_INSTALLER_MISMATCH' }
+      - name: Actual installed updater and default synthetic profile
+        run: |
+          ./qa/windows-update-smoke.ps1 -Installer ./saminbun-setup-0.1.59-x64.exe -InstallerSha256 6f0d200c58d82d0cad32884bd404284fbd6f91a80b7a950885293e5ffa0e1875 -FromVersion 0.1.59 -ToVersion 0.1.63
+      - name: Sanitized result only, no profile artifacts
+        if: always()
+        run: |
+          if (Test-Path qa/result.json) {
+            $json = Get-Content qa/result.json -Raw
+            $result = $json | ConvertFrom-Json
+            "## Windows 0.1.59 → 0.1.63 smoke" >> $env:GITHUB_STEP_SUMMARY
+            "Completed: $($result.completed); stage: $($result.stage)" >> $env:GITHUB_STEP_SUMMARY
+            'Synthetic HTTPS API only; production server/account/provider collection not tested in this smoke.' >> $env:GITHUB_STEP_SUMMARY
+            Write-Output $json
+          } else { Write-Output 'QA_RESULT_NOT_CREATED: earlier preflight failed.' }
