@@ -52,6 +52,11 @@ $FixtureUrl = $null
 $FixtureJobId = $null
 $Result = [ordered]@{ fromVersion=$FromVersion; toVersion=$ToVersion; completed=$false; stage='initial'; productionLoginPerformed=$false }
 
+function Set-QaStage([string]$Stage) {
+  $Result.stage=$Stage
+  Write-Host ("QA_STAGE="+$Stage)
+}
+
 function New-ExactStartInfo([string]$File, [string[]]$Arguments) {
   $Info = [Diagnostics.ProcessStartInfo]::new($File); $Info.UseShellExecute = $false
   $Info.Environment.Clear()
@@ -277,7 +282,7 @@ function Get-InitialInstallDiagnostic([Diagnostics.Process]$SetupProcess, [Colle
   return $Diagnostic
 }
 function Wait-InitialInstaller([Diagnostics.Process]$SetupProcess) {
-  # Keep the original 120-second bound; observe before choosing a new timeout.
+  # Fresh Windows runners completed in 85/90 seconds, but another reached 120 seconds inside the installer child PowerShell. Keep a bounded 240-second limit with observations.
   $Watch=[Diagnostics.Stopwatch]::StartNew()
   $TrackedIds=[Collections.Generic.HashSet[int]]::new(); $null=$TrackedIds.Add($SetupProcess.Id)
   $Snapshots=[Collections.Generic.List[object]]::new()
@@ -286,7 +291,7 @@ function Wait-InitialInstaller([Diagnostics.Process]$SetupProcess) {
   $Result.initialInstallerEnvironmentPresence=@(@('SystemRoot','TEMP','TMP','USERPROFILE','APPDATA','LOCALAPPDATA','ProgramData','ALLUSERSPROFILE','USERNAME','OS','NUMBER_OF_PROCESSORS','PROCESSOR_ARCHITECTURE','SESSIONNAME') | ForEach-Object {
     [ordered]@{ name=$_; parentPresent=[bool][Environment]::GetEnvironmentVariable($_); forwarded=($ForwardedNames -contains $_) }
   })
-  foreach ($Checkpoint in @(2,15,60,120)) {
+  foreach ($Checkpoint in @(2,15,60,120,180,240)) {
     $Remaining=[Math]::Max(0, [int](($Checkpoint-$Watch.Elapsed.TotalSeconds)*1000))
     $Exited=$SetupProcess.WaitForExit($Remaining)
     $Snapshots.Add((Get-InitialInstallDiagnostic $SetupProcess $TrackedIds ([int]$Watch.Elapsed.TotalSeconds)))
@@ -303,7 +308,7 @@ function Wait-InitialInstaller([Diagnostics.Process]$SetupProcess) {
     if ($SetupProcess.ExitCode -ne 0) { throw 'INITIAL_NSIS_EXIT_NONZERO' }
     return
   }
-  $Result.initialInstallerTimeoutSeconds=120
+  $Result.initialInstallerTimeoutSeconds=240
   throw 'INITIAL_NSIS_TIMEOUT'
 }
 
@@ -314,7 +319,7 @@ try {
     Add-Type -Path (Join-Path $Wpf 'UIAutomationTypes.dll')
     Add-Type -Path (Join-Path $Wpf 'UIAutomationClient.dll')
   }
-  $Result.stage = 'install-old'
+  Set-QaStage 'install-old'
   $Setup = Start-ExactProcess $Installer @('/S')
   Wait-InitialInstaller $Setup
   $Location = [IO.Path]::GetFullPath((Get-ItemProperty -LiteralPath $InstallKey).InstallLocation)
@@ -331,14 +336,14 @@ try {
     [IO.File]::WriteAllText($File, $Token)
   }
   $Port = Free-Port; $Old = Start-QaApp $Port
-  $Result.stage = 'main-check-download'
+  Set-QaStage 'main-check-download'
   $Result.download = Invoke-Bridge 'prepare' $Port
-  $Result.stage = 'native-cancel'
+  Set-QaStage 'native-cancel'
   $Result.beforeNativeConfirmation=Invoke-Bridge 'native-state' $Port
   $null = Invoke-Bridge 'request-install' $Port
   Invoke-NativeButton $Old.Id '취소' $Port
   $Result.cancel = Invoke-Bridge 'cancel-check' $Port
-  $Result.stage = 'native-confirm-install'
+  Set-QaStage 'native-confirm-install'
   $null = Invoke-Bridge 'request-install' $Port
   $UpgradeStarted = [DateTime]::Now
   Invoke-NativeButton $Old.Id '저장했고, 재시작하기' $Port
@@ -361,14 +366,14 @@ try {
   } catch { $Result.autoWindowVersionTextObserved = $false }
   Assert-ProfilePreserved
   $Result.syntheticProfileFilesPreservedAfterUpdate = 6
-  $Result.stage = 'independent-restart-readback'
+  Set-QaStage 'independent-restart-readback'
   Wait-Until { $New.Refresh(); return $New.MainWindowHandle -ne [IntPtr]::Zero } 30 'AUTO_RELAUNCH_WINDOW_UNAVAILABLE' | Out-Null
   Close-OwnedApp $New
   $Port = Free-Port; $Verified = Start-QaApp $Port
   $Result.readback = Invoke-Bridge 'verify' $Port
   Assert-ProfilePreserved
   Close-OwnedApp $Verified
-  $Result.stage = 'synthetic-https-fixture'
+  Set-QaStage 'synthetic-https-fixture'
   $OpenSsl = Get-Command openssl -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   $OpenSslPath = if ($OpenSsl) { $OpenSsl.Source } else { Join-Path $env:ProgramFiles 'Git\usr\bin\openssl.exe' }
   if (-not (Test-Path -LiteralPath $OpenSslPath -PathType Leaf)) { throw 'OWNED_FIXTURE_OPENSSL_MISSING' }
@@ -388,7 +393,7 @@ try {
     try { return (Get-Content -LiteralPath $FixtureReport -Raw | ConvertFrom-Json).ready } catch { return $false }
   } 15 'OWNED_FIXTURE_NOT_READY' | Out-Null
   $Port = Free-Port; $Observer = Start-QaApp $Port
-  $Result.stage = 'real-app-synthetic-server-start'
+  Set-QaStage 'real-app-synthetic-server-start'
   try {
     $Result.syntheticStart = Invoke-Bridge 'server-start' $Port
     if ($Result.syntheticStart.outcome -ne 'accepted') { throw 'SYNTHETIC_SERVER_START_BRIDGE_EARLY_FAILURE' }
@@ -401,7 +406,7 @@ try {
     throw
   }
   $FixtureJobId = $Accepted.job.jobId
-  $Result.stage = 'real-app-close-before-synthetic-completion'
+  Set-QaStage 'real-app-close-before-synthetic-completion'
   Close-OwnedApp $Observer
   if (-not $Observer.HasExited) { throw 'OWNED_APP_PID_STILL_PRESENT' }
   @{ mainPidGone=$true; closedAt=[DateTime]::UtcNow.ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath $ClosedMarker -Encoding utf8NoBOM
@@ -410,7 +415,7 @@ try {
     return $false
   } 35 'SYNTHETIC_SERVER_DID_NOT_COMPLETE_AFTER_APP_CLOSE'
   if ($FixtureProcess.HasExited -or $Finished.startPosts -ne 1 -or $Finished.forbiddenJobWrites -ne 0 -or -not $Finished.protocol2Observed) { throw 'SYNTHETIC_SERVER_PROCESS_OR_WRITE_ASSERTION_FAILED' }
-  $Result.stage = 'real-app-relaunch-synthetic-server-readback'
+  Set-QaStage 'real-app-relaunch-synthetic-server-readback'
   $Port = Free-Port; $Readback = Start-QaApp $Port
   $Result.syntheticServerReadback = Invoke-Bridge 'server-readback' $Port
   Close-OwnedApp $Readback
@@ -418,7 +423,7 @@ try {
   if ($FinalFixture.startPosts -ne 1 -or $FinalFixture.forbiddenJobWrites -ne 0 -or $FinalFixture.failure -or $FinalFixture.revision -ne 2 -or $FinalFixture.job.jobId -ne $FixtureJobId) { throw 'SYNTHETIC_SERVER_FINAL_ASSERTION_FAILED' }
   Assert-ProfilePreserved
   $Result.syntheticServer = [ordered]@{ actualInstalledElectronBridge=$true; actualPassiveJobGetObserved=$true; nativeMainPidExitedBeforeCompletion=$true; independentNodeServiceCompleted=$true; reloadedSameJob=$true; revision=2; startPosts=1; forbiddenStepCompleteCancelWrites=0; protocol2Observed=$true; tlsVerificationPreserved=$true; ephemeralCaScopedToOwnedAppChild=$true; productionBackendTested=$false }
-  $Result.stage = 'uninstall-retains-data'
+  Set-QaStage 'uninstall-retains-data'
   $Uninstaller = Join-Path $Location 'Uninstall saminbun.exe'
   $Removal = Start-ExactProcess $Uninstaller @('/S')
   if (-not $Removal.WaitForExit(90000)) { throw 'UNINSTALL_TIMEOUT' }
@@ -426,7 +431,7 @@ try {
   Assert-ProfilePreserved
   $Result.syntheticProfileFilesPreservedAfterUninstall = 6
   $Result.uninstallerRegistryRemoved = $true; $Result.syntheticUserDataRetained = $true
-  $Result.completed = $true; $Result.stage = 'complete'
+  $Result.completed = $true; Set-QaStage 'complete'
 } finally {
   if ($FixtureProcess -and -not $FixtureProcess.HasExited) { $FixtureProcess.Kill(); $FixtureProcess.WaitForExit(5000) | Out-Null }
   # Only processes started/identified by this run and this exact installed path.
