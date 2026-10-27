@@ -18,7 +18,8 @@ if ($FromVersion -eq $ToVersion) { throw 'QA_REQUIRES_DISTINCT_VERSIONS' }
 $Installer = (Resolve-Path -LiteralPath $Installer).Path
 if ((Split-Path $Installer -Leaf) -ne "saminbun-setup-$FromVersion-x64.exe") { throw 'INSTALLER_NAME_MISMATCH' }
 if ((Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash -ne $InstallerSha256) { throw 'INSTALLER_HASH_MISMATCH' }
-$Node = (Get-Command node -CommandType Application).Source
+$Node = (Get-Command node -CommandType Application | Select-Object -First 1).Source
+if (-not ($Node -is [string]) -or -not (Test-Path -LiteralPath $Node -PathType Leaf)) { throw 'EXACT_NODE_EXECUTABLE_REQUIRED' }
 $Helper = Join-Path $PSScriptRoot 'windows-update-smoke.mjs'
 if (-not (Test-Path -LiteralPath $Helper -PathType Leaf)) { throw 'QA_HELPER_MISSING' }
 $Guid = 'd24e5421-91c4-5ae4-ae45-da0dd8712d5b' # builder UUID.v5(com.saminbun.desktop, official NSIS namespace)
@@ -282,7 +283,7 @@ try {
   Assert-ProfilePreserved
   Close-OwnedApp $Verified
   $Result.stage = 'synthetic-https-fixture'
-  $OpenSsl = Get-Command openssl -CommandType Application -ErrorAction SilentlyContinue
+  $OpenSsl = Get-Command openssl -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   $OpenSslPath = if ($OpenSsl) { $OpenSsl.Source } else { Join-Path $env:ProgramFiles 'Git\usr\bin\openssl.exe' }
   if (-not (Test-Path -LiteralPath $OpenSslPath -PathType Leaf)) { throw 'OWNED_FIXTURE_OPENSSL_MISSING' }
   $QaCertificate = Join-Path $Evidence 'synthetic-ca.pem'
