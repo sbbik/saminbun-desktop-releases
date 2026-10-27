@@ -201,6 +201,110 @@ function Get-SyntheticFixtureDiagnostic([string]$ReportPath) {
   } catch { }
   return $Diagnostic
 }
+function Get-UpgradeObservation([DateTime]$UpgradeUtc, [int]$OldPid, [Collections.Generic.HashSet[int]]$TrackedIds, [int]$ElapsedSeconds) {
+  $Diagnostic=[ordered]@{ observedAtUtc=[DateTime]::UtcNow.ToString('o'); elapsedSeconds=$ElapsedSeconds; upgradeRequestedAtUtc=$UpgradeUtc.ToString('o'); oldPid=$OldPid
+    exactExePresent=(Test-Path -LiteralPath $AppExe -PathType Leaf); installedPeVersion=$null; installedRegistryVersion=$null
+    peIsTargetVersion=$false; registryIsTargetVersion=$false; oldVersionStillPresent=$false
+    processQueryAvailable=$false; exactAppProcesses=@(); upgradeHelperProcesses=@(); helperStillRunning=$false; cacheExecutables=@(); ownedWindows=@(); classification='unconfirmed' }
+  try { if ($Diagnostic.exactExePresent) { $Version=(Get-Item -LiteralPath $AppExe).VersionInfo.ProductVersion; if ($Version -match '^\d+\.\d+\.\d+$') { $Diagnostic.installedPeVersion=$Version } } } catch { }
+  try { if (Test-Path -LiteralPath $UninstallKey) { $Version=(Get-ItemProperty -LiteralPath $UninstallKey).DisplayVersion; if ($Version -match '^\d+\.\d+\.\d+$') { $Diagnostic.installedRegistryVersion=$Version } } } catch { }
+  $Diagnostic.peIsTargetVersion=$Diagnostic.installedPeVersion -eq $ToVersion
+  $Diagnostic.registryIsTargetVersion=$Diagnostic.installedRegistryVersion -eq $ToVersion
+  $Diagnostic.oldVersionStillPresent=$Diagnostic.installedPeVersion -eq $FromVersion -or $Diagnostic.installedRegistryVersion -eq $FromVersion
+  $CacheRoot=[IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'saminbun-desktop-updater'))
+  $Separator=[IO.Path]::DirectorySeparatorChar
+  $TempRoot=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd($Separator)+$Separator
+  $WindowsRoot=[IO.Path]::GetFullPath($env:SystemRoot).TrimEnd($Separator)+$Separator
+  $InstallRoot=[IO.Path]::GetFullPath($ExpectedInstall).TrimEnd($Separator)+$Separator
+  $CachePrefix=$CacheRoot.TrimEnd($Separator)+$Separator
+  try {
+    if (Test-Path -LiteralPath $CacheRoot -PathType Container) {
+      $Diagnostic.cacheExecutables=@(Get-ChildItem -LiteralPath $CacheRoot -File -Filter '*.exe' -Recurse -ErrorAction Stop | Select-Object -First 6 | ForEach-Object {
+        [ordered]@{ path=(Protect-QaDiagnosticText $_.FullName); bytes=$_.Length; lastWriteUtc=$_.LastWriteTimeUtc.ToString('o') }
+      })
+    }
+  } catch { $Diagnostic.cacheInspectionUnavailable=$true }
+  try {
+    $All=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate,SessionId,ReadTransferCount,WriteTransferCount -ErrorAction Stop)
+    for ($Depth=0; $Depth -lt 8; $Depth++) {
+      $Added=$false
+      foreach ($Entry in $All) {
+        if (-not $Entry.ExecutablePath -or -not $Entry.CreationDate) { continue }
+        $CreatedUtc=([DateTime]$Entry.CreationDate).ToUniversalTime()
+        if ($CreatedUtc -lt $UpgradeUtc -or $TrackedIds.Contains([int]$Entry.ProcessId) -or $TrackedIds.Count -ge 32) { continue }
+        $Path=[string]$Entry.ExecutablePath
+        $InCache=$Path.StartsWith($CachePrefix, [StringComparison]::OrdinalIgnoreCase)
+        $RestrictedPath=$InCache -or $Path.StartsWith($TempRoot,[StringComparison]::OrdinalIgnoreCase) -or $Path.StartsWith($WindowsRoot,[StringComparison]::OrdinalIgnoreCase) -or $Path.StartsWith($InstallRoot,[StringComparison]::OrdinalIgnoreCase)
+        if ($InCache -or ($Path -ieq $AppExe) -or ($RestrictedPath -and $TrackedIds.Contains([int]$Entry.ParentProcessId))) { $null=$TrackedIds.Add([int]$Entry.ProcessId); $Added=$true }
+      }
+      if (-not $Added) { break }
+    }
+    $Diagnostic.processQueryAvailable=$true
+    $Diagnostic.exactAppProcesses=@($All | Where-Object { $_.ExecutablePath -ieq $AppExe } | Select-Object -First 12 | ForEach-Object {
+      [ordered]@{ pid=[int]$_.ProcessId; parentPid=[int]$_.ParentProcessId; sessionId=$_.SessionId; creationUtc=([DateTime]$_.CreationDate).ToUniversalTime().ToString('o'); differentFromOldPid=([int]$_.ProcessId -ne $OldPid); createdAfterRequest=(([DateTime]$_.CreationDate).ToUniversalTime() -ge $UpgradeUtc) }
+    })
+    $Diagnostic.upgradeHelperProcesses=@($All | Where-Object { $TrackedIds.Contains([int]$_.ProcessId) -and [int]$_.ProcessId -ne $OldPid -and $_.ExecutablePath -ine $AppExe } | Select-Object -First 24 | ForEach-Object {
+      [ordered]@{ pid=[int]$_.ProcessId; parentPid=[int]$_.ParentProcessId; sessionId=$_.SessionId; executableName=(Protect-QaDiagnosticText $_.Name); path=(Protect-QaDiagnosticText $_.ExecutablePath); creationUtc=([DateTime]$_.CreationDate).ToUniversalTime().ToString('o'); readTransferBytes=$_.ReadTransferCount; writeTransferBytes=$_.WriteTransferCount }
+    })
+    $Diagnostic.helperStillRunning=$Diagnostic.upgradeHelperProcesses.Count -gt 0
+    try {
+      $Windows=[Collections.Generic.List[object]]::new()
+      $Tops=[Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children,[Windows.Automation.Condition]::TrueCondition)
+      foreach ($Top in $Tops) {
+        if ($Windows.Count -ge 6) { break }
+        if (-not $TrackedIds.Contains([int]$Top.Current.ProcessId)) { continue }
+        $Nodes=[Collections.Generic.List[object]]::new()
+        foreach ($Element in $Top.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition)) {
+          if ($Nodes.Count -ge 24) { break }
+          if ($Element.Current.IsPassword) { continue }
+          $Name=Protect-QaDiagnosticText $Element.Current.Name
+          if ($Name) { $Nodes.Add([ordered]@{ type=$Element.Current.ControlType.ProgrammaticName; name=$Name; enabled=$Element.Current.IsEnabled }) }
+        }
+        $Windows.Add([ordered]@{ pid=$Top.Current.ProcessId; title=(Protect-QaDiagnosticText $Top.Current.Name); controls=@($Nodes.ToArray()) })
+      }
+      $Diagnostic.ownedWindows=@($Windows.ToArray()); $Diagnostic.uiQueryAvailable=$true
+    } catch { $Diagnostic.uiQueryAvailable=$false }
+  } catch { $Diagnostic.processQueryAvailable=$false }
+  if ($Diagnostic.helperStillRunning) { $Diagnostic.classification='upgrade-helper-still-running' }
+  elseif ($Diagnostic.peIsTargetVersion -and $Diagnostic.registryIsTargetVersion) { $Diagnostic.classification='target-version-present-without-observed-auto-main' }
+  elseif ($Diagnostic.oldVersionStillPresent) { $Diagnostic.classification='old-version-remains-without-observed-helper' }
+  else { $Diagnostic.classification='transitional-or-unavailable-version-state' }
+  return $Diagnostic
+}
+function Wait-AutomaticRelaunch([DateTime]$UpgradeUtc, [int]$OldPid) {
+  # Run4 auto-relaunch passed; run6 exceeded 180s. A bounded 360s observation
+  # adds evidence, not a claim that a timing change fixes the unknown cause.
+  $Watch=[Diagnostics.Stopwatch]::StartNew()
+  $TrackedIds=[Collections.Generic.HashSet[int]]::new(); $null=$TrackedIds.Add($OldPid)
+  $Snapshots=[Collections.Generic.List[object]]::new(); $Result.automaticRelaunchObservations=$Snapshots
+  $Result.automaticRelaunchLimitSeconds=360; $Result.automaticRelaunchObserved=$false
+  $Result.upgradeRequestedAtUtc=$UpgradeUtc.ToString('o'); $Result.oldMainExitObservedAtUtc=[DateTime]::UtcNow.ToString('o')
+  $Checkpoints=@(0,15,60,120,180,240,300,360); $NextCheckpoint=0
+  while ($Watch.Elapsed.TotalSeconds -le 360) {
+    $NewInfo=$null
+    try {
+      $NewInfo=Get-CimInstance Win32_Process -Filter "Name='saminbun.exe'" -ErrorAction Stop | Where-Object {
+        $_.ExecutablePath -ieq $AppExe -and $_.ProcessId -ne $OldPid -and ([DateTime]$_.CreationDate).ToUniversalTime() -ge $UpgradeUtc -and $_.CommandLine -notmatch '--type='
+      } | Select-Object -First 1
+    } catch { }
+    if ($NewInfo) {
+      $null=$TrackedIds.Add([int]$NewInfo.ProcessId)
+      $Snapshot=Get-UpgradeObservation $UpgradeUtc $OldPid $TrackedIds ([int]$Watch.Elapsed.TotalSeconds)
+      $Snapshot.classification='automatic-new-main-observed'; $Snapshots.Add($Snapshot)
+      $Result.automaticRelaunchObservedAtUtc=[DateTime]::UtcNow.ToString('o')
+      $Result.automaticRelaunchCandidatePid=[int]$NewInfo.ProcessId
+      $Result.automaticRelaunchCandidateCreationUtc=([DateTime]$NewInfo.CreationDate).ToUniversalTime().ToString('o')
+      return $NewInfo
+    }
+    if ($NextCheckpoint -lt $Checkpoints.Count -and $Watch.Elapsed.TotalSeconds -ge $Checkpoints[$NextCheckpoint]) {
+      $Snapshots.Add((Get-UpgradeObservation $UpgradeUtc $OldPid $TrackedIds ([int]$Watch.Elapsed.TotalSeconds))); $NextCheckpoint++
+    }
+    Start-Sleep -Milliseconds 2000
+  }
+  $Final=Get-UpgradeObservation $UpgradeUtc $OldPid $TrackedIds ([int]$Watch.Elapsed.TotalSeconds); $Snapshots.Add($Final)
+  $Result.automaticRelaunchFinalClassification=$Final.classification
+  throw 'AUTOMATIC_RELAUNCH_NOT_OBSERVED'
+}
 function Close-OwnedApp([Diagnostics.Process]$Process) {
   if (-not $OwnedPids.Contains($Process.Id)) { throw 'PROCESS_NOT_OWNED' }
   if (-not $Process.HasExited) {
@@ -345,14 +449,10 @@ try {
   $Result.cancel = Invoke-Bridge 'cancel-check' $Port
   Set-QaStage 'native-confirm-install'
   $null = Invoke-Bridge 'request-install' $Port
-  $UpgradeStarted = [DateTime]::Now
+  $UpgradeStarted = [DateTime]::UtcNow
   Invoke-NativeButton $Old.Id '저장했고, 재시작하기' $Port
   if (-not $Old.WaitForExit(60000)) { throw 'OLD_APP_DID_NOT_EXIT' }
-  $NewInfo = Wait-Until {
-    return Get-CimInstance Win32_Process -Filter "Name='saminbun.exe'" | Where-Object {
-      $_.ExecutablePath -ieq $AppExe -and $_.ProcessId -ne $Old.Id -and $_.CreationDate -ge $UpgradeStarted -and $_.CommandLine -notmatch '--type='
-    } | Select-Object -First 1
-  } 180 'AUTOMATIC_RELAUNCH_NOT_OBSERVED'
+  $NewInfo = Wait-AutomaticRelaunch $UpgradeStarted $Old.Id
   $New = Get-Process -Id $NewInfo.ProcessId; $OwnedPids.Add($New.Id)
   if ((Get-Item -LiteralPath $AppExe).VersionInfo.ProductVersion -ne $ToVersion -or
       (Get-ItemProperty -LiteralPath $UninstallKey).DisplayVersion -ne $ToVersion) { throw 'UPDATED_FILE_OR_REGISTRY_VERSION_MISMATCH' }
