@@ -62,13 +62,35 @@ async function run() {
       assert.equal(saved.serverUrl, fixture.href);
       const login = await page.evaluate(() => window.saminbun.request({ method: "POST", path: "/v1/session", body: {
         workspaceSlug: "qa-windows", loginId: "qa-user", password: "Synthetic-QA-only-2026!" } }));
-      assert.equal(login.status, 200);
+      const safePublicError = (outcome, response) => ({ phase: "synthetic-server-start-requested-via-real-installed-app", outcome,
+        status: Number.isInteger(response?.status) && response.status >= 100 && response.status <= 599 ? response.status : null,
+        code: /^[A-Z][A-Z0-9_]{1,63}$/.test(response?.body?.error?.code || "") ? response.body.error.code : null });
+      if (login.status !== 200) return safePublicError("login-error", login);
       const jobs = await page.evaluate(() => window.saminbun.getApiOrderJobs());
-      assert.equal(jobs.status, 200); assert.equal(jobs.body.capabilities.serverExecution, true); assert.equal(jobs.body.jobs.length, 0);
-      // Start the actual public bridge promise without creating a QA runtime global.
-      // It remains pending while the native main controller observes GET-only.
-      await page.evaluate(() => { void window.saminbun.importApiOrders({ platform: "self", period: { start: "2026-10-01", end: "2026-10-01" }, expectedRevision: 1, executionMode: "server" }).catch(() => {}); });
-      return { phase: "synthetic-server-start-requested-via-real-installed-app" };
+      if (jobs.status !== 200) return safePublicError("initial-jobs-error", jobs);
+      assert.equal(jobs.body.capabilities.serverExecution, true); assert.equal(jobs.body.jobs.length, 0);
+      // Observe the actual public promise and actual GET jobs concurrently. An
+      // early main/preflight error must be reported rather than swallowed.
+      const started = await page.evaluate(async () => {
+        const safe = response => ({ status: Number.isInteger(response?.status) && response.status >= 100 && response.status <= 599 ? response.status : null,
+          code: /^[A-Z][A-Z0-9_]{1,63}$/.test(response?.body?.error?.code || "") ? response.body.error.code : null });
+        const importing = window.saminbun.importApiOrders({ platform: "self", period: { start: "2026-10-01", end: "2026-10-01" }, expectedRevision: 1, executionMode: "server" })
+          .then(response => ({ outcome: "import-returned-early", ...safe(response) }))
+          .catch(() => ({ outcome: "import-rejected", status: null, code: null }));
+        const observing = (async () => {
+          const deadline = Date.now() + 7000;
+          while (Date.now() < deadline) {
+            const response = await window.saminbun.getApiOrderJobs();
+            if (response.status !== 200) return { outcome: "jobs-read-error", ...safe(response) };
+            if (response.body?.jobs?.some(job => job.status === "collecting" && job.execution?.mode === "server"))
+              return { outcome: "accepted", status: 200, code: null };
+            await new Promise(resolve => setTimeout(resolve, 150));
+          }
+          return { outcome: "start-not-observed", status: null, code: null };
+        })().catch(() => ({ outcome: "jobs-read-rejected", status: null, code: null }));
+        return Promise.race([importing, observing, new Promise(resolve => setTimeout(() => resolve({ outcome: "start-observation-timeout", status: null, code: null }), 8000))]);
+      });
+      return { phase: "synthetic-server-start-requested-via-real-installed-app", ...started };
     }
     assert.equal(config.serverUrl, fixture.href); assert.equal(config.lastAccount.loginId, "qa-user");
     const jobs = await page.evaluate(() => window.saminbun.getApiOrderJobs());
@@ -78,8 +100,12 @@ async function run() {
     assert.equal(job.receipt.result.total, 1);
     const state = await page.evaluate(() => window.saminbun.request({ method: "GET", path: "/v1/state" }));
     assert.equal(state.status, 200); assert.equal(state.body.revision, 2);
+    assert.equal(state.body.workspaceId, "7d90967e-0eb1-4ed5-b78c-2cc631ce22e5");
+    assert.equal(state.body.data.records.length, 1);
+    assert.equal(state.body.data.records[0].orderId, "QA-WINDOWS-SERVER-ORDER-001");
+    assert.equal(state.body.data.records[0].revenue, 1000);
     assert.equal(await page.evaluate(() => localStorage.getItem("saminbun.synthetic-update-smoke")), token);
-    return { phase: "synthetic-server-post-close-readback", currentVersion: config.version, sameJob: true, completed: true, revision: 2, localStorageSentinelPreserved: true };
+    return { phase: "synthetic-server-post-close-readback", currentVersion: config.version, sameJob: true, completed: true, revision: 2, syntheticOrderCount: 1, syntheticOrderReadbackVerified: true, localStorageSentinelPreserved: true };
   }
   if (mode === "prepare") {
     assert.equal(config.version, from);

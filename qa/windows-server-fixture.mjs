@@ -2,15 +2,18 @@
 import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
 
 export function createFixture({ key, cert, report, closedMarker, delayMs = 20000 }) {
-  const token = `synthetic-only-${randomUUID()}`;
-  const session = { workspace: { id: 'qa-workspace', slug: 'qa-windows', name: 'Synthetic QA' },
-    user: { id: 'qa-user', loginId: 'qa-user', displayName: 'Synthetic QA', role: 'master' },
+  const token = randomBytes(32).toString('hex');
+  const session = { workspace: { id: '7d90967e-0eb1-4ed5-b78c-2cc631ce22e5', slug: 'qa-windows', name: 'Synthetic QA' },
+    user: { id: '11b854d4-8674-4bf0-9c90-62469145f9b5', loginId: 'qa-user', displayName: 'Synthetic QA', role: 'master' },
     permissions: ['orders.read', 'orders.collect'] };
+  const createdAt = new Date().toISOString();
+  const syntheticOrder = { resource: 'orders', platform: 'self', source: 'synthetic-windows-qa', date: '2026-10-01',
+    orderId: 'QA-WINDOWS-SERVER-ORDER-001', sourceOrderLineId: 'QA-WINDOWS-SERVER-LINE-001', productName: 'Synthetic Windows QA', quantity: 1, revenue: 1000, grossRevenue: 1000, status: 'completed' };
   let job = null, revision = 1, timer;
   const state = { ready: false, revision, startPosts: 0, observerJobGets: 0, forbiddenJobWrites: 0, protocol2Observed: false,
     acceptedAt: null, appClosedAt: null, completedAt: null, completedAfterAppClosed: false, job: null, failure: null };
@@ -33,7 +36,7 @@ export function createFixture({ key, cert, report, closedMarker, delayMs = 20000
       }
       if (req.headers.authorization !== `Bearer ${token}`) return reply(res, 401, { error: { code: 'UNAUTHORIZED', mayHaveSaved: false } });
       if (route === `${root}/session` && req.method === 'GET') return reply(res, 200, session);
-      if (route === `${root}/state` && req.method === 'GET') return reply(res, 200, { revision, synthetic: true });
+      if (route === `${root}/state` && req.method === 'GET') return reply(res, 200, { workspaceId: session.workspace.id, revision, updatedAt: state.completedAt || createdAt, data: { records: revision === 2 ? [syntheticOrder] : [] }, hiddenSections: [] });
       const jobs = `${root}/api-order-jobs`;
       if (route.startsWith(jobs)) {
         assert.equal(req.headers['x-saminbun-order-protocol'], '2'); state.protocol2Observed = true;

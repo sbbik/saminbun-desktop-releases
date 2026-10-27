@@ -177,6 +177,25 @@ function Invoke-NativeButton([int]$OwnerPid, [string]$ButtonName, [int]$Port) {
     throw
   }
 }
+function Get-SyntheticFixtureDiagnostic([string]$ReportPath) {
+  $Diagnostic=[ordered]@{ reportAvailable=$false; startPosts=$null; observerJobGets=$null; forbiddenJobWrites=$null; protocol2Observed=$false; failure=$null; jobPresent=$false; jobStatus=$null; executionMode=$null; revision=$null }
+  try {
+    $Report=Get-Content -LiteralPath $ReportPath -Raw | ConvertFrom-Json
+    $Diagnostic.reportAvailable=$true
+    foreach ($Counter in @('startPosts','observerJobGets','forbiddenJobWrites','revision')) {
+      $Value=$Report.$Counter
+      if (($Value -is [long] -or $Value -is [int] -or $Value -is [double]) -and [double]::IsFinite([double]$Value) -and $Value -ge 0 -and $Value -le 1000000) { $Diagnostic[$Counter]=$Value }
+    }
+    $Diagnostic.protocol2Observed=$Report.protocol2Observed -eq $true
+    if ($Report.failure -match '^[A-Z][A-Z0-9_]{1,63}$') { $Diagnostic.failure=$Report.failure }
+    $Diagnostic.jobPresent=[bool]$Report.job
+    if ($Report.job) {
+      if ($Report.job.status -in @('collecting','ready','completed','cancelled','failed','expired')) { $Diagnostic.jobStatus=$Report.job.status }
+      if ($Report.job.execution.mode -in @('server','client')) { $Diagnostic.executionMode=$Report.job.execution.mode }
+    }
+  } catch { }
+  return $Diagnostic
+}
 function Close-OwnedApp([Diagnostics.Process]$Process) {
   if (-not $OwnedPids.Contains($Process.Id)) { throw 'PROCESS_NOT_OWNED' }
   if (-not $Process.HasExited) {
@@ -370,11 +389,17 @@ try {
   } 15 'OWNED_FIXTURE_NOT_READY' | Out-Null
   $Port = Free-Port; $Observer = Start-QaApp $Port
   $Result.stage = 'real-app-synthetic-server-start'
-  $Result.syntheticStart = Invoke-Bridge 'server-start' $Port
-  $Accepted = Wait-Until {
+  try {
+    $Result.syntheticStart = Invoke-Bridge 'server-start' $Port
+    if ($Result.syntheticStart.outcome -ne 'accepted') { throw 'SYNTHETIC_SERVER_START_BRIDGE_EARLY_FAILURE' }
+    $Accepted = Wait-Until {
     try { $Report = Get-Content -LiteralPath $FixtureReport -Raw | ConvertFrom-Json; if ($Report.job -and $Report.job.status -eq 'collecting' -and $Report.startPosts -eq 1 -and $Report.observerJobGets -gt 0 -and -not $Report.failure) { return $Report } } catch { }
     return $false
   } 10 'SYNTHETIC_SERVER_START_NOT_ACCEPTED'
+  } catch {
+    $Result.syntheticStartFixtureDiagnostic=Get-SyntheticFixtureDiagnostic $FixtureReport
+    throw
+  }
   $FixtureJobId = $Accepted.job.jobId
   $Result.stage = 'real-app-close-before-synthetic-completion'
   Close-OwnedApp $Observer
