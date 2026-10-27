@@ -79,7 +79,8 @@ function Invoke-Bridge([string]$Mode, [int]$Port) {
   $Info.RedirectStandardOutput = $true; $Info.RedirectStandardError = $true
   $Bridge = [Diagnostics.Process]::Start($Info)
   $Output = $Bridge.StandardOutput.ReadToEndAsync(); $Diagnostic = $Bridge.StandardError.ReadToEndAsync()
-  if (-not $Bridge.WaitForExit(780000)) { $Bridge.Kill(); throw "BRIDGE_PHASE_TIMEOUT_$Mode" }
+  $BridgeTimeout = if ($Mode -eq 'native-state') { 45000 } else { 780000 }
+  if (-not $Bridge.WaitForExit($BridgeTimeout)) { $Bridge.Kill(); throw "BRIDGE_PHASE_TIMEOUT_$Mode" }
   $null = $Diagnostic.GetAwaiter().GetResult()
   if ($Bridge.ExitCode -ne 0) { throw "BRIDGE_PHASE_FAILED_$Mode" }
   return ($Output.GetAwaiter().GetResult() | ConvertFrom-Json)
@@ -96,20 +97,85 @@ function Start-QaApp([int]$Port) {
   Wait-Until { try { $null = Invoke-RestMethod "http://127.0.0.1:$Port/json/version" -TimeoutSec 1; return $true } catch { return $false } } 30 'CDP_LOOPBACK_UNAVAILABLE' | Out-Null
   return $Process
 }
-function Invoke-NativeButton([int]$OwnerPid, [string]$ButtonName) {
-  $Dialog = Wait-Until {
-    $Conditions = [Windows.Automation.AndCondition]::new(
-      [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty, $OwnerPid),
-      [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, '3인분 업데이트'))
-    return [Windows.Automation.AutomationElement]::RootElement.FindFirst([Windows.Automation.TreeScope]::Children, $Conditions)
-  } 20 'NATIVE_CONFIRM_DIALOG_UNAVAILABLE'
-  $Condition = [Windows.Automation.AndCondition]::new(
-    [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, $ButtonName),
+function Get-OwnedDialogCandidates([int]$OwnerPid) {
+  $OwnerCondition=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty, $OwnerPid)
+  $TitleCondition=[Windows.Automation.AndCondition]::new(
+    $OwnerCondition,
+    [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, '3인분 업데이트'))
+  $Candidates=[Collections.Generic.List[object]]::new()
+  $Tops=[Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children, $OwnerCondition)
+  foreach ($Top in $Tops) {
+    if ($Top.Current.Name -eq '3인분 업데이트') { $Candidates.Add($Top) }
+    # A native owned dialog may be nested under its app window in the UIA tree.
+    $Nested=$Top.FindAll([Windows.Automation.TreeScope]::Descendants, $TitleCondition)
+    foreach ($Candidate in $Nested) {
+      if ($Candidates.Count -ge 12) { break }
+      if ($Candidate.Current.ControlType -eq [Windows.Automation.ControlType]::Window) { $Candidates.Add($Candidate) }
+    }
+    if ($Candidates.Count -ge 12) { break }
+  }
+  return $Candidates.ToArray()
+}
+function Get-DialogButton($Dialog, [string]$Name) {
+  $Condition=[Windows.Automation.AndCondition]::new(
+    [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, $Name),
     [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Button))
-  $Button = $Dialog.FindFirst([Windows.Automation.TreeScope]::Descendants, $Condition)
-  if (-not $Button -or -not $Button.Current.IsEnabled) { throw 'NATIVE_CONFIRM_BUTTON_UNAVAILABLE' }
-  $Pattern = $Button.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)
-  $Pattern.Invoke()
+  return $Dialog.FindFirst([Windows.Automation.TreeScope]::Descendants, $Condition)
+}
+function Get-NativeConfirmationDiagnostic([int]$OwnerPid, [int]$Port) {
+  $Diagnostic=[ordered]@{ ownerPid=$OwnerPid; uiQueryAvailable=$false; ownedWindows=@(); matchingTitleCandidates=@(); publicUpdateState=@{available=$false} }
+  try {
+    $OwnerCondition=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty, $OwnerPid)
+    $Tops=[Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children, $OwnerCondition)
+    $Windows=[Collections.Generic.List[object]]::new()
+    foreach ($Top in $Tops) {
+      if ($Windows.Count -ge 6) { break }
+      $Nodes=[Collections.Generic.List[object]]::new()
+      $Elements=$Top.FindAll([Windows.Automation.TreeScope]::Descendants, [Windows.Automation.Condition]::TrueCondition)
+      foreach ($Element in $Elements) {
+        if ($Nodes.Count -ge 36) { break }
+        if ($Element.Current.IsPassword) { continue }
+        $Type=$Element.Current.ControlType
+        if ($Type -notin @([Windows.Automation.ControlType]::Window, [Windows.Automation.ControlType]::Button, [Windows.Automation.ControlType]::Text)) { continue }
+        $Name=Protect-QaDiagnosticText $Element.Current.Name
+        if ($Name) { $Nodes.Add([ordered]@{ type=$Type.ProgrammaticName; name=$Name; enabled=$Element.Current.IsEnabled }) }
+      }
+      $Windows.Add([ordered]@{ pid=$Top.Current.ProcessId; title=(Protect-QaDiagnosticText $Top.Current.Name); nodes=@($Nodes.ToArray()) })
+    }
+    $Diagnostic.ownedWindows=@($Windows.ToArray())
+    $Matches=[Collections.Generic.List[object]]::new()
+    foreach ($Candidate in @(Get-OwnedDialogCandidates $OwnerPid)) {
+      $Question=$Candidate.FindFirst([Windows.Automation.TreeScope]::Descendants, [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, '저장 후 재시작하여 업데이트할까요?'))
+      $Cancel=Get-DialogButton $Candidate '취소'; $Confirm=Get-DialogButton $Candidate '저장했고, 재시작하기'
+      $Matches.Add([ordered]@{ ownerPid=$Candidate.Current.ProcessId; exactTitle=($Candidate.Current.Name -eq '3인분 업데이트'); expectedQuestionPresent=[bool]$Question; cancelButtonPresent=[bool]$Cancel; confirmButtonPresent=[bool]$Confirm })
+    }
+    $Diagnostic.matchingTitleCandidates=@($Matches.ToArray()); $Diagnostic.uiQueryAvailable=$true
+  } catch { $Diagnostic.uiQueryAvailable=$false }
+  try { $Diagnostic.publicUpdateState=Invoke-Bridge 'native-state' $Port } catch { $Diagnostic.publicUpdateState=@{available=$false} }
+  return $Diagnostic
+}
+function Invoke-NativeButton([int]$OwnerPid, [string]$ButtonName, [int]$Port) {
+  try {
+    if ($ButtonName -notin @('취소', '저장했고, 재시작하기')) { throw 'NATIVE_BUTTON_NOT_ALLOWED' }
+    $Dialog=Wait-Until {
+      $Matches=[Collections.Generic.List[object]]::new()
+      foreach ($Candidate in @(Get-OwnedDialogCandidates $OwnerPid)) {
+        if ($Candidate.Current.ProcessId -ne $OwnerPid -or $Candidate.Current.Name -ne '3인분 업데이트') { continue }
+        $Question=$Candidate.FindFirst([Windows.Automation.TreeScope]::Descendants, [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, '저장 후 재시작하여 업데이트할까요?'))
+        if ($Question -and (Get-DialogButton $Candidate '취소') -and (Get-DialogButton $Candidate '저장했고, 재시작하기')) { $Matches.Add($Candidate) }
+      }
+      if ($Matches.Count -gt 1) { throw 'NATIVE_CONFIRM_DIALOG_NOT_UNIQUE' }
+      if ($Matches.Count -eq 1) { return $Matches[0] }
+      return $null
+    } 20 'NATIVE_CONFIRM_DIALOG_UNAVAILABLE'
+    $Button=Get-DialogButton $Dialog $ButtonName
+    if (-not $Button -or -not $Button.Current.IsEnabled -or $Button.Current.ProcessId -ne $OwnerPid) { throw 'NATIVE_CONFIRM_BUTTON_UNAVAILABLE' }
+    $Pattern=$Button.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)
+    $Pattern.Invoke()
+  } catch {
+    $Result.nativeConfirmationFailure=Get-NativeConfirmationDiagnostic $OwnerPid $Port
+    throw
+  }
 }
 function Close-OwnedApp([Diagnostics.Process]$Process) {
   if (-not $OwnedPids.Contains($Process.Id)) { throw 'PROCESS_NOT_OWNED' }
@@ -249,13 +315,14 @@ try {
   $Result.stage = 'main-check-download'
   $Result.download = Invoke-Bridge 'prepare' $Port
   $Result.stage = 'native-cancel'
+  $Result.beforeNativeConfirmation=Invoke-Bridge 'native-state' $Port
   $null = Invoke-Bridge 'request-install' $Port
-  Invoke-NativeButton $Old.Id '취소'
+  Invoke-NativeButton $Old.Id '취소' $Port
   $Result.cancel = Invoke-Bridge 'cancel-check' $Port
   $Result.stage = 'native-confirm-install'
   $null = Invoke-Bridge 'request-install' $Port
   $UpgradeStarted = [DateTime]::Now
-  Invoke-NativeButton $Old.Id '저장했고, 재시작하기'
+  Invoke-NativeButton $Old.Id '저장했고, 재시작하기' $Port
   if (-not $Old.WaitForExit(60000)) { throw 'OLD_APP_DID_NOT_EXIT' }
   $NewInfo = Wait-Until {
     return Get-CimInstance Win32_Process -Filter "Name='saminbun.exe'" | Where-Object {

@@ -34,6 +34,20 @@ async function run() {
   } while (Date.now() < deadline);
   assert.equal(pages.length, 1, "QA_APP_PAGE_NOT_UNIQUE"); const page = pages[0];
   await page.waitForFunction(() => Boolean(window.saminbun?.getUpdateState), undefined, { timeout: 30000 });
+  if (values["--mode"] === "native-state") {
+    try {
+      const state = await Promise.race([page.evaluate(() => window.saminbun.getUpdateState()),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("STATE_TIMEOUT")), 5000))]);
+      const version = value => /^\d+\.\d+\.\d+$/.test(value || "") ? value : null;
+      return { phase: "native-confirmation-public-state", available: true,
+        status: /^[a-z-]{1,40}$/.test(state.status || "") ? state.status : "other",
+        currentVersion: version(state.currentVersion), availableVersion: version(state.availableVersion),
+        updateRequired: state.updateRequired === true,
+        blockedByPendingWork: typeof state.message === "string" && state.message.includes("진행 중이거나 결과를 확인하지 못한 작업"),
+        cancelled: typeof state.message === "string" && state.message.includes("설치를 취소"),
+        progress: Number.isFinite(state.progress) ? Math.min(100, Math.max(0, state.progress)) : null };
+    } catch { return { phase: "native-confirmation-public-state", available: false }; }
+  }
   const config = await page.evaluate(() => window.saminbun.getConfig());
   assert.equal(config.platform, "win32"); if (!["server-start", "server-readback"].includes(values["--mode"])) assert(!config.lastAccount, "No real/saved account may be present");
   const mode = values["--mode"], token = values["--sentinel"], from = values["--from"], to = values["--to"];
