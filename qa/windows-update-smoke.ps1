@@ -525,9 +525,34 @@ try {
   $Result.syntheticServer = [ordered]@{ actualInstalledElectronBridge=$true; actualPassiveJobGetObserved=$true; nativeMainPidExitedBeforeCompletion=$true; independentNodeServiceCompleted=$true; reloadedSameJob=$true; revision=2; startPosts=1; forbiddenStepCompleteCancelWrites=0; protocol2Observed=$true; tlsVerificationPreserved=$true; ephemeralCaScopedToOwnedAppChild=$true; productionBackendTested=$false }
   Set-QaStage 'uninstall-retains-data'
   $Uninstaller = Join-Path $Location 'Uninstall saminbun.exe'
+  $Result.uninstallRequestedAtUtc=[DateTime]::UtcNow.ToString('o')
   $Removal = Start-ExactProcess $Uninstaller @('/S')
   if (-not $Removal.WaitForExit(90000)) { throw 'UNINSTALL_TIMEOUT' }
-  Wait-Until { -not (Test-Path $UninstallKey) -and -not (Test-Path -LiteralPath $AppExe) } 45 'UNINSTALL_NOT_CONFIRMED' | Out-Null
+  $Result.uninstallerLauncherExitCode=$Removal.ExitCode
+  if ($Removal.ExitCode -ne 0) { throw 'UNINSTALL_LAUNCHER_NONZERO' }
+  # NSIS may return from its launcher before the temporary uninstaller finishes.
+  # Run7 reached all core checks but its old 45s observation ended too early to
+  # establish removal. Observe bounded state; do not assume a cause or success.
+  $UninstallWatch=[Diagnostics.Stopwatch]::StartNew()
+  $UninstallSamples=[Collections.Generic.List[object]]::new()
+  $Result.uninstallObservations=$UninstallSamples
+  $Result.uninstallObservationLimitSeconds=240
+  $NextSample=0; $UninstallConfirmed=$false
+  while ($UninstallWatch.Elapsed.TotalSeconds -le 240) {
+    $RegistryPresent=Test-Path -LiteralPath $UninstallKey
+    $ExePresent=Test-Path -LiteralPath $AppExe
+    if ($UninstallWatch.Elapsed.TotalSeconds -ge $NextSample -or (-not $RegistryPresent -and -not $ExePresent)) {
+      $UninstallSamples.Add([ordered]@{ atUtc=[DateTime]::UtcNow.ToString('o'); elapsedSeconds=[int]$UninstallWatch.Elapsed.TotalSeconds; uninstallRegistryPresent=$RegistryPresent; appExePresent=$ExePresent; profileFilesPreserved=$true })
+      Assert-ProfilePreserved
+      $NextSample+=15
+    }
+    if (-not $RegistryPresent -and -not $ExePresent) { $UninstallConfirmed=$true; break }
+    Start-Sleep -Milliseconds 500
+  }
+  if (-not $UninstallConfirmed) {
+    try { $Result.uninstallerDirectChildren=@(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($Removal.Id)" | Select-Object -First 8 | ForEach-Object { [ordered]@{pid=$_.ProcessId; executableName=(Protect-QaDiagnosticText $_.Name); sessionId=$_.SessionId} }) } catch { $Result.uninstallerProcessQueryUnavailable=$true }
+    throw 'UNINSTALL_NOT_CONFIRMED'
+  }
   Assert-ProfilePreserved
   $Result.syntheticProfileFilesPreservedAfterUninstall = 6
   $Result.uninstallerRegistryRemoved = $true; $Result.syntheticUserDataRetained = $true
