@@ -1,4 +1,4 @@
-# Local preparation only. Execute only after separate public-script/CI approval.
+# Public QA only, approved for the exact public release repository and fresh hosted VM.
 # Requires a fresh GitHub-hosted Windows VM; never run on a user's computer.
 [CmdletBinding()]
 param(
@@ -118,6 +118,109 @@ function Close-OwnedApp([Diagnostics.Process]$Process) {
   }
 }
 
+
+# Read-only diagnostics for this synthetic VM's exact installer process tree.
+# No command lines, environment values, UI ValuePattern, profile content or clicks.
+function Protect-QaDiagnosticText([string]$Value) {
+  if (-not $Value) { return '' }
+  foreach ($RootName in @('USERPROFILE', 'TEMP', 'TMP', 'APPDATA', 'LOCALAPPDATA')) {
+    $RootValue = [Environment]::GetEnvironmentVariable($RootName)
+    if ($RootValue) { $Value = $Value.Replace($RootValue, "<$RootName>") }
+  }
+  $Value = $Value.Replace($Token, '<qa-run-id>') -replace '[\x00-\x1f]', ' '
+  if ($Value.Length -gt 180) { return $Value.Substring(0, 180) + '...' }
+  return $Value
+}
+function Get-InitialInstallDiagnostic([Diagnostics.Process]$SetupProcess, [Collections.Generic.HashSet[int]]$TrackedIds, [int]$ElapsedSeconds) {
+  $Diagnostic = [ordered]@{
+    elapsedSeconds=$ElapsedSeconds; setupPid=$SetupProcess.Id; parentSessionId=[Diagnostics.Process]::GetCurrentProcess().SessionId
+    userInteractive=[Environment]::UserInteractive; parent64Bit=[Environment]::Is64BitProcess
+    setupExited=$false; setupExitCode=$null; processQueryAvailable=$false; processes=@(); windows=@()
+    installRegistryPresent=(Test-Path -LiteralPath $InstallKey); uninstallRegistryPresent=(Test-Path -LiteralPath $UninstallKey)
+    machineUninstallRegistryPresent=(Test-Path -LiteralPath $MachineKey); expectedInstallDirectoryPresent=(Test-Path -LiteralPath $ExpectedInstall)
+    expectedExePresent=(Test-Path -LiteralPath (Join-Path $ExpectedInstall 'saminbun.exe'))
+    expectedUninstallerPresent=(Test-Path -LiteralPath (Join-Path $ExpectedInstall 'Uninstall saminbun.exe'))
+    expectedAsarPresent=$false; expectedAsarBytes=$null; profileDirectoryPresent=(Test-Path -LiteralPath $QaProfile)
+  }
+  try {
+    $SetupProcess.Refresh(); $Diagnostic.setupExited = $SetupProcess.HasExited
+    if ($Diagnostic.setupExited) { $Diagnostic.setupExitCode = $SetupProcess.ExitCode }
+  } catch { $Diagnostic.setupProcessInspectionUnavailable=$true }
+  $AsarPath = Join-Path $ExpectedInstall 'resources\app.asar'
+  if (Test-Path -LiteralPath $AsarPath -PathType Leaf) {
+    $Diagnostic.expectedAsarPresent=$true
+    try { $Diagnostic.expectedAsarBytes=(Get-Item -LiteralPath $AsarPath).Length } catch { }
+  }
+  try {
+    $All = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,ExecutablePath,SessionId,ReadTransferCount,WriteTransferCount -ErrorAction Stop)
+    for ($Depth=0; $Depth -lt 8; $Depth++) {
+      $Added=$false
+      foreach ($Entry in $All) {
+        if ($TrackedIds.Count -lt 32 -and $TrackedIds.Contains([int]$Entry.ParentProcessId) -and -not $TrackedIds.Contains([int]$Entry.ProcessId)) {
+          $null=$TrackedIds.Add([int]$Entry.ProcessId); $Added=$true
+        }
+      }
+      if (-not $Added) { break }
+    }
+    $Diagnostic.processQueryAvailable=$true
+    $Diagnostic.processes=@($All | Where-Object { $TrackedIds.Contains([int]$_.ProcessId) } | Select-Object -First 32 | ForEach-Object {
+      [ordered]@{ pid=[int]$_.ProcessId; parentPid=[int]$_.ParentProcessId; sessionId=$_.SessionId
+        executableName=(Protect-QaDiagnosticText $_.Name); executablePath=(Protect-QaDiagnosticText $_.ExecutablePath)
+        readTransferBytes=$_.ReadTransferCount; writeTransferBytes=$_.WriteTransferCount }
+    })
+  } catch { $Diagnostic.processQueryAvailable=$false }
+  try {
+    $TopWindows=[Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children, [Windows.Automation.Condition]::TrueCondition)
+    $Windows=[Collections.Generic.List[object]]::new()
+    foreach ($TopWindow in $TopWindows) {
+      if ($Windows.Count -ge 6) { break }
+      if (-not $TrackedIds.Contains([int]$TopWindow.Current.ProcessId)) { continue }
+      $Controls=[Collections.Generic.List[object]]::new()
+      $Elements=$TopWindow.FindAll([Windows.Automation.TreeScope]::Descendants, [Windows.Automation.Condition]::TrueCondition)
+      foreach ($Element in $Elements) {
+        if ($Controls.Count -ge 24) { break }
+        # Name only; never read input values or invoke any UI control.
+        if ($Element.Current.IsPassword) { continue }
+        $Name=Protect-QaDiagnosticText $Element.Current.Name
+        if ($Name) { $Controls.Add([ordered]@{ type=$Element.Current.ControlType.ProgrammaticName; name=$Name; enabled=$Element.Current.IsEnabled }) }
+      }
+      $Windows.Add([ordered]@{ pid=$TopWindow.Current.ProcessId; title=(Protect-QaDiagnosticText $TopWindow.Current.Name); enabled=$TopWindow.Current.IsEnabled; controls=@($Controls.ToArray()) })
+    }
+    $Diagnostic.windows=@($Windows.ToArray()); $Diagnostic.uiQueryAvailable=$true
+  } catch { $Diagnostic.uiQueryAvailable=$false }
+  return $Diagnostic
+}
+function Wait-InitialInstaller([Diagnostics.Process]$SetupProcess) {
+  # Keep the original 120-second bound; observe before choosing a new timeout.
+  $Watch=[Diagnostics.Stopwatch]::StartNew()
+  $TrackedIds=[Collections.Generic.HashSet[int]]::new(); $null=$TrackedIds.Add($SetupProcess.Id)
+  $Snapshots=[Collections.Generic.List[object]]::new()
+  $Result.initialInstallerDiagnostics=$Snapshots
+  $ForwardedNames=@('SystemRoot','WINDIR','PATH','PATHEXT','TEMP','TMP','USERPROFILE','APPDATA','LOCALAPPDATA','HOMEDRIVE','HOMEPATH','COMSPEC','ProgramFiles','ProgramFiles(x86)','CommonProgramFiles','GITHUB_ACTIONS','RUNNER_OS','RUNNER_ENVIRONMENT','GITHUB_REPOSITORY')
+  $Result.initialInstallerEnvironmentPresence=@(@('SystemRoot','TEMP','TMP','USERPROFILE','APPDATA','LOCALAPPDATA','ProgramData','ALLUSERSPROFILE','USERNAME','OS','NUMBER_OF_PROCESSORS','PROCESSOR_ARCHITECTURE','SESSIONNAME') | ForEach-Object {
+    [ordered]@{ name=$_; parentPresent=[bool][Environment]::GetEnvironmentVariable($_); forwarded=($ForwardedNames -contains $_) }
+  })
+  foreach ($Checkpoint in @(2,15,60,120)) {
+    $Remaining=[Math]::Max(0, [int](($Checkpoint-$Watch.Elapsed.TotalSeconds)*1000))
+    $Exited=$SetupProcess.WaitForExit($Remaining)
+    $Snapshots.Add((Get-InitialInstallDiagnostic $SetupProcess $TrackedIds ([int]$Watch.Elapsed.TotalSeconds)))
+    if ($Exited) {
+      $Result.initialInstallerExitCode=$SetupProcess.ExitCode
+      if ($SetupProcess.ExitCode -ne 0) { throw 'INITIAL_NSIS_EXIT_NONZERO' }
+      return
+    }
+  }
+  # A final state distinction avoids conflating a deadline with a nonzero exit.
+  $SetupProcess.Refresh()
+  if ($SetupProcess.HasExited) {
+    $Result.initialInstallerExitCode=$SetupProcess.ExitCode
+    if ($SetupProcess.ExitCode -ne 0) { throw 'INITIAL_NSIS_EXIT_NONZERO' }
+    return
+  }
+  $Result.initialInstallerTimeoutSeconds=120
+  throw 'INITIAL_NSIS_TIMEOUT'
+}
+
 try {
   try { Add-Type -AssemblyName UIAutomationClient; Add-Type -AssemblyName UIAutomationTypes }
   catch {
@@ -127,7 +230,7 @@ try {
   }
   $Result.stage = 'install-old'
   $Setup = Start-ExactProcess $Installer @('/S')
-  if (-not $Setup.WaitForExit(120000) -or $Setup.ExitCode -ne 0) { throw 'INITIAL_NSIS_INSTALL_FAILED' }
+  Wait-InitialInstaller $Setup
   $Location = [IO.Path]::GetFullPath((Get-ItemProperty -LiteralPath $InstallKey).InstallLocation)
   if ($Location -ine $ExpectedInstall) { throw 'INSTALL_LOCATION_UNEXPECTED' }
   $AppExe = Join-Path $Location 'saminbun.exe'
@@ -246,7 +349,7 @@ try {
   # No broad cleanup, no recursive deletion of profiles. Fresh VM disposal owns
   # final cleanup; partial failures preserve evidence and never claim success.
   $Result.installedByThisRun = $InstalledHere
-  $Result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'result.json') -Encoding utf8
-  $Result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Evidence 'result.json') -Encoding utf8
-  $Result | ConvertTo-Json -Depth 8
+  $Result | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'result.json') -Encoding utf8
+  $Result | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Evidence 'result.json') -Encoding utf8
+  $Result | ConvertTo-Json -Depth 12
 }
