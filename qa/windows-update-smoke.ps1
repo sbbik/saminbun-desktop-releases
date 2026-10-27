@@ -542,8 +542,8 @@ try {
     $RegistryPresent=Test-Path -LiteralPath $UninstallKey
     $ExePresent=Test-Path -LiteralPath $AppExe
     if ($UninstallWatch.Elapsed.TotalSeconds -ge $NextSample -or (-not $RegistryPresent -and -not $ExePresent)) {
-      $UninstallSamples.Add([ordered]@{ atUtc=[DateTime]::UtcNow.ToString('o'); elapsedSeconds=[int]$UninstallWatch.Elapsed.TotalSeconds; uninstallRegistryPresent=$RegistryPresent; appExePresent=$ExePresent; profileFilesPreserved=$true })
       Assert-ProfilePreserved
+      $UninstallSamples.Add([ordered]@{ atUtc=[DateTime]::UtcNow.ToString('o'); elapsedSeconds=[int]$UninstallWatch.Elapsed.TotalSeconds; uninstallRegistryPresent=$RegistryPresent; appExePresent=$ExePresent; profileFilesPreserved=$true })
       $NextSample+=15
     }
     if (-not $RegistryPresent -and -not $ExePresent) { $UninstallConfirmed=$true; break }
